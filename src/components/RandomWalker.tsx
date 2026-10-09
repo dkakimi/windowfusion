@@ -1,9 +1,7 @@
 "use client";
 import { useEffect } from "react";
 
-const SPEED     = 110;
-const PAUSE_MIN = 700;
-const PAUSE_MAX = 2200;
+const SPEED = 160; // px/s
 
 export function RandomWalker() {
   useEffect(() => {
@@ -12,28 +10,25 @@ export function RandomWalker() {
     const s  = screen as Screen & { availLeft?: number; availTop?: number };
     const aL = s.availLeft ?? 0;
     const aT = s.availTop  ?? 0;
+    const aW = screen.availWidth;
+    const aH = screen.availHeight;
 
+    // Random initial direction, constant speed (DVD-logo style)
+    const angle = Math.random() * Math.PI * 2;
+    let vx = Math.cos(angle) * SPEED;
+    let vy = Math.sin(angle) * SPEED;
+
+    // Start from current window position
     let x = window.screenX;
     let y = window.screenY;
-    let tx = x, ty = y;
-    let pauseUntil = 0;
-    let paused = false; // hover pause
 
-    const pickTarget = () => {
-      const W = window.outerWidth;
-      const H = window.outerHeight;
-      tx = aL + 10 + Math.random() * Math.max(0, screen.availWidth  - W - 20);
-      ty = aT + 10 + Math.random() * Math.max(0, screen.availHeight - H - 20);
-    };
-    pickTarget();
+    let paused = false;
 
-    // Pause on hover so the user can click the × button
     const onEnter = () => { paused = true; };
     const onLeave = () => { paused = false; };
     document.addEventListener("mouseenter", onEnter);
     document.addEventListener("mouseleave", onLeave);
 
-    // Close on BroadcastChannel command
     const ctrl = new BroadcastChannel("windowfusion-ctrl");
     ctrl.addEventListener("message", (e: MessageEvent) => {
       if (e.data?.type === "close_all") window.close();
@@ -46,20 +41,20 @@ export function RandomWalker() {
       const dt = Math.min((now - prev) / 1000, 0.05);
       prev = now;
 
-      if (!paused && now >= pauseUntil) {
-        const dx = tx - x;
-        const dy = ty - y;
-        const d  = Math.sqrt(dx * dx + dy * dy);
+      if (!paused) {
+        const W = window.outerWidth;
+        const H = window.outerHeight;
 
-        if (d < 6) {
-          pauseUntil = now + PAUSE_MIN + Math.random() * (PAUSE_MAX - PAUSE_MIN);
-          pickTarget();
-        } else {
-          const step = Math.min(SPEED * dt, d);
-          x += (dx / d) * step;
-          y += (dy / d) * step;
-          window.moveTo(Math.round(x), Math.round(y));
-        }
+        x += vx * dt;
+        y += vy * dt;
+
+        // Bounce off screen edges
+        if (x <= aL)           { x = aL;           vx =  Math.abs(vx); }
+        if (x + W >= aL + aW)  { x = aL + aW - W;  vx = -Math.abs(vx); }
+        if (y <= aT)            { y = aT;            vy =  Math.abs(vy); }
+        if (y + H >= aT + aH)  { y = aT + aH - H;  vy = -Math.abs(vy); }
+
+        window.moveTo(Math.round(x), Math.round(y));
       }
 
       animId = requestAnimationFrame(tick);
