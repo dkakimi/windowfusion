@@ -4,102 +4,99 @@ export interface WindowInfo {
   screenY: number;
   width: number;
   height: number;
+  color: [number, number, number];
   lastSeen: number;
 }
 
-type MessageType =
-  | { type: "heartbeat"; id: string; screenX: number; screenY: number; width: number; height: number }
+type Message =
+  | { type: "heartbeat"; id: string; screenX: number; screenY: number; width: number; height: number; color: [number, number, number] }
   | { type: "leave"; id: string };
 
+function hslToRgb(h: number, s: number, l: number): [number, number, number] {
+  const a = s * Math.min(l, 1 - l);
+  const f = (n: number) => {
+    const k = (n + h * 12) % 12;
+    return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+  };
+  return [f(0), f(8), f(4)];
+}
+
+function idToColor(id: string): [number, number, number] {
+  let hash = 0;
+  for (let i = 0; i < id.length; i++) {
+    hash = ((hash * 31) + id.charCodeAt(i)) >>> 0;
+  }
+  // Use evenly distributed hues, high saturation, medium-high lightness
+  const hue = (hash % 360) / 360;
+  return hslToRgb(hue, 1.0, 0.65);
+}
+
 export class WindowSync {
-  myId: string;
+  readonly myId: string;
+  readonly myColor: [number, number, number];
   windows: Map<string, WindowInfo>;
   onWindowsChange?: (windows: Map<string, WindowInfo>) => void;
 
   private channel: BroadcastChannel;
-  private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
-  private cleanupInterval: ReturnType<typeof setInterval> | null = null;
-  private readonly STALE_TIMEOUT_MS = 2000;
-  private readonly HEARTBEAT_INTERVAL_MS = 200;
-  private readonly CLEANUP_INTERVAL_MS = 500;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor() {
     this.myId = crypto.randomUUID();
+    this.myColor = idToColor(this.myId);
     this.windows = new Map();
     this.channel = new BroadcastChannel("windowfusion");
-
     this.channel.addEventListener("message", this.handleMessage);
 
-    this.heartbeatInterval = setInterval(
-      () => this.broadcastHeartbeat(),
-      this.HEARTBEAT_INTERVAL_MS
-    );
-
-    this.cleanupInterval = setInterval(
-      () => this.cleanupStaleWindows(),
-      this.CLEANUP_INTERVAL_MS
-    );
-
+    this.heartbeatTimer = setInterval(() => this.broadcast(), 150);
+    this.cleanupTimer = setInterval(() => this.prune(), 400);
     window.addEventListener("beforeunload", this.handleUnload);
-
-    // Send initial heartbeat immediately
-    this.broadcastHeartbeat();
+    this.broadcast();
   }
 
-  private broadcastHeartbeat(): void {
-    const msg: MessageType = {
+  private broadcast(): void {
+    const msg: Message = {
       type: "heartbeat",
       id: this.myId,
       screenX: window.screenX,
       screenY: window.screenY,
       width: window.outerWidth,
       height: window.outerHeight,
+      color: this.myColor,
     };
     this.channel.postMessage(msg);
   }
 
-  private handleMessage = (event: MessageEvent<MessageType>): void => {
-    const data = event.data;
-
-    if (data.type === "heartbeat") {
-      const existing = this.windows.get(data.id);
-      const info: WindowInfo = {
-        id: data.id,
-        screenX: data.screenX,
-        screenY: data.screenY,
-        width: data.width,
-        height: data.height,
+  private handleMessage = (e: MessageEvent<Message>): void => {
+    const d = e.data;
+    if (d.type === "heartbeat") {
+      const isNew = !this.windows.has(d.id);
+      this.windows.set(d.id, {
+        id: d.id,
+        screenX: d.screenX,
+        screenY: d.screenY,
+        width: d.width,
+        height: d.height,
+        color: d.color,
         lastSeen: Date.now(),
-      };
-      this.windows.set(data.id, info);
-      if (!existing) {
-        this.onWindowsChange?.(this.windows);
-      }
-    } else if (data.type === "leave") {
-      if (this.windows.has(data.id)) {
-        this.windows.delete(data.id);
-        this.onWindowsChange?.(this.windows);
-      }
+      });
+      if (isNew) this.onWindowsChange?.(this.windows);
+    } else if (d.type === "leave") {
+      if (this.windows.delete(d.id)) this.onWindowsChange?.(this.windows);
     }
   };
 
-  private cleanupStaleWindows(): void {
-    const now = Date.now();
+  private prune(): void {
+    const cutoff = Date.now() - 1500;
     let changed = false;
     for (const [id, info] of this.windows) {
-      if (now - info.lastSeen > this.STALE_TIMEOUT_MS) {
-        this.windows.delete(id);
-        changed = true;
-      }
+      if (info.lastSeen < cutoff) { this.windows.delete(id); changed = true; }
     }
-    if (changed) {
-      this.onWindowsChange?.(this.windows);
-    }
+    if (changed) this.onWindowsChange?.(this.windows);
   }
 
   private handleUnload = (): void => {
-    const msg: MessageType = { type: "leave", id: this.myId };
-    this.channel.postMessage(msg);
+    this.channel.postMessage({ type: "leave", id: this.myId } satisfies Message);
     this.destroy();
   };
 
@@ -110,19 +107,14 @@ export class WindowSync {
       screenY: window.screenY,
       width: window.outerWidth,
       height: window.outerHeight,
+      color: this.myColor,
       lastSeen: Date.now(),
     };
   }
 
   destroy(): void {
-    if (this.heartbeatInterval !== null) {
-      clearInterval(this.heartbeatInterval);
-      this.heartbeatInterval = null;
-    }
-    if (this.cleanupInterval !== null) {
-      clearInterval(this.cleanupInterval);
-      this.cleanupInterval = null;
-    }
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    if (this.cleanupTimer) clearInterval(this.cleanupTimer);
     window.removeEventListener("beforeunload", this.handleUnload);
     this.channel.removeEventListener("message", this.handleMessage);
     this.channel.close();

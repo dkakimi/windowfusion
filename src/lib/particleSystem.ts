@@ -1,13 +1,15 @@
 import * as THREE from "three";
 import type { WindowInfo } from "./windowSync";
 
-const PARTICLE_COUNT = 2000;
-const INTERACTION_RANGE = 300;
-const INTERACTION_K = 8000;
-const GRAVITY_K = 0.3;
-const MAX_SPEED = 300;
-const Z_RANGE = 500; // -500 to +500
+const PARTICLE_COUNT = 1500;
+const INTERACTION_RANGE = 350;  // screen px between window edges to trigger interaction
+const ATTRACTION_K = 15000;     // force constant toward other window edge
+const GRAVITY_K = 0.015;        // gentle pull toward own window center
+const DAMPING = 0.97;
+const MAX_SPEED = 400;
+const Z_RANGE = 300;
 
+// Sphere with Phong lighting — particles look like solid 3D balls
 const vertexShader = /* glsl */ `
 uniform float uWindowX;
 uniform float uWindowY;
@@ -21,289 +23,257 @@ varying float vAlpha;
 void main() {
   vColor = aColor;
 
-  // Convert screen-world position to NDC
   float nx = ((position.x - uWindowX) / uWidth) * 2.0 - 1.0;
   float ny = -(((position.y - uWindowY) / uHeight) * 2.0 - 1.0);
-  float nz = position.z / 1000.0;
+  float nz = position.z / (float(${Z_RANGE}) * 2.0);
 
   gl_Position = vec4(nx, ny, nz, 1.0);
 
-  // Size based on depth (closer = bigger)
-  float depth = (position.z + 500.0) / 1000.0; // 0 to 1
-  gl_PointSize = aSize * (0.5 + depth);
+  // Depth-based size: closer (z > 0) = bigger
+  float depthScale = 0.6 + 0.4 * ((position.z + float(${Z_RANGE})) / float(${Z_RANGE * 2}));
+  gl_PointSize = aSize * depthScale;
 
-  vAlpha = 0.3 + depth * 0.7;
+  vAlpha = 0.7 + 0.3 * depthScale;
 }
 `;
 
+// Phong-shaded sphere SDF on gl_PointCoord
 const fragmentShader = /* glsl */ `
 varying vec3 vColor;
 varying float vAlpha;
 
 void main() {
-  vec2 coord = gl_PointCoord - vec2(0.5);
-  float dist = length(coord);
-  if (dist > 0.5) discard;
+  // Map PointCoord to [-1, 1]
+  vec2 uv = gl_PointCoord * 2.0 - 1.0;
+  float r2 = dot(uv, uv);
+  if (r2 > 1.0) discard;
 
-  float alpha = 1.0 - smoothstep(0.1, 0.5, dist);
-  alpha *= vAlpha;
+  // Surface normal of sphere at this fragment
+  vec3 N = normalize(vec3(uv, sqrt(1.0 - r2)));
 
-  // Glow: bright core, colored halo
-  vec3 color = mix(vec3(1.0), vColor, smoothstep(0.0, 0.3, dist));
+  // Key light from upper-right-front
+  vec3 L = normalize(vec3(0.8, 1.2, 2.0));
+  // View direction (orthographic → constant)
+  vec3 V = vec3(0.0, 0.0, 1.0);
+  vec3 H = normalize(L + V);
 
-  gl_FragColor = vec4(color, alpha);
+  float diff = max(dot(N, L), 0.0);
+  float spec = pow(max(dot(N, H), 0.0), 80.0);
+
+  vec3 ambient  = vColor * 0.18;
+  vec3 diffuse  = vColor * diff * 0.82;
+  vec3 specular = vec3(1.0) * spec * 0.55;
+
+  vec3 color = ambient + diffuse + specular;
+  gl_FragColor = vec4(color, vAlpha);
 }
 `;
 
 interface Particle {
-  x: number;
-  y: number;
-  z: number;
-  vx: number;
-  vy: number;
-  vz: number;
-  r: number;
-  g: number;
-  b: number;
+  x: number; y: number; z: number;
+  vx: number; vy: number; vz: number;
+  // Base color of this window (never changes)
+  br: number; bg: number; bb: number;
+  // Rendered color (lerps toward other window's color near edges)
+  r: number; g: number; b: number;
   size: number;
 }
 
 export class ParticleSystem {
-  private particles: Particle[];
+  private particles: Particle[] = [];
   private geometry: THREE.BufferGeometry;
   private material: THREE.ShaderMaterial;
   points: THREE.Points;
 
-  private positionAttr: THREE.BufferAttribute;
-  private colorAttr: THREE.BufferAttribute;
+  private posAttr: THREE.BufferAttribute;
+  private colAttr: THREE.BufferAttribute;
   private sizeAttr: THREE.BufferAttribute;
+  private initialized = false;
 
   constructor() {
-    this.particles = [];
     this.geometry = new THREE.BufferGeometry();
 
-    const positions = new Float32Array(PARTICLE_COUNT * 3);
-    const colors = new Float32Array(PARTICLE_COUNT * 3);
-    const sizes = new Float32Array(PARTICLE_COUNT);
+    const pos  = new Float32Array(PARTICLE_COUNT * 3);
+    const col  = new Float32Array(PARTICLE_COUNT * 3);
+    const size = new Float32Array(PARTICLE_COUNT);
 
-    this.positionAttr = new THREE.BufferAttribute(positions, 3);
-    this.colorAttr = new THREE.BufferAttribute(colors, 3);
-    this.sizeAttr = new THREE.BufferAttribute(sizes, 1);
+    this.posAttr  = new THREE.BufferAttribute(pos, 3);
+    this.colAttr  = new THREE.BufferAttribute(col, 3);
+    this.sizeAttr = new THREE.BufferAttribute(size, 1);
 
-    this.geometry.setAttribute("position", this.positionAttr);
-    this.geometry.setAttribute("aColor", this.colorAttr);
-    this.geometry.setAttribute("aSize", this.sizeAttr);
+    this.geometry.setAttribute("position", this.posAttr);
+    this.geometry.setAttribute("aColor",   this.colAttr);
+    this.geometry.setAttribute("aSize",    this.sizeAttr);
 
     this.material = new THREE.ShaderMaterial({
       vertexShader,
       fragmentShader,
       transparent: true,
-      blending: THREE.AdditiveBlending,
+      blending: THREE.NormalBlending,
+      depthTest: false,
       depthWrite: false,
       uniforms: {
         uWindowX: { value: 0 },
         uWindowY: { value: 0 },
-        uWidth: { value: 1 },
-        uHeight: { value: 1 },
+        uWidth:   { value: 1 },
+        uHeight:  { value: 1 },
       },
     });
 
     this.points = new THREE.Points(this.geometry, this.material);
 
-    // Particles will be initialized on first update when we have window info
     for (let i = 0; i < PARTICLE_COUNT; i++) {
       this.particles.push({
-        x: 0,
-        y: 0,
-        z: (Math.random() - 0.5) * Z_RANGE * 2,
-        vx: (Math.random() - 0.5) * 100,
-        vy: (Math.random() - 0.5) * 100,
-        vz: (Math.random() - 0.5) * 50,
-        r: Math.random(),
-        g: Math.random(),
-        b: Math.random() * 0.5 + 0.5,
-        size: Math.random() * 8 + 4,
+        x: 0, y: 0, z: (Math.random() - 0.5) * Z_RANGE * 2,
+        vx: (Math.random() - 0.5) * 80,
+        vy: (Math.random() - 0.5) * 80,
+        vz: (Math.random() - 0.5) * 30,
+        br: 1, bg: 1, bb: 1,
+        r: 1, g: 1, b: 1,
+        size: Math.random() * 10 + 14, // 14–24px
       });
     }
   }
 
-  private spawnParticles(myWindow: WindowInfo): void {
+  private spawn(myWindow: WindowInfo): void {
+    const [br, bg, bb] = myWindow.color;
     for (const p of this.particles) {
-      p.x = myWindow.screenX + Math.random() * myWindow.width;
-      p.y = myWindow.screenY + Math.random() * myWindow.height;
-
-      // Pick a color palette: cyan/blue/purple/white
-      const hue = Math.random();
-      if (hue < 0.33) {
-        // Cyan
-        p.r = 0.0;
-        p.g = 0.8 + Math.random() * 0.2;
-        p.b = 1.0;
-      } else if (hue < 0.66) {
-        // Purple/violet
-        p.r = 0.5 + Math.random() * 0.5;
-        p.g = 0.0;
-        p.b = 1.0;
-      } else {
-        // White/blue
-        p.r = 0.6 + Math.random() * 0.4;
-        p.g = 0.6 + Math.random() * 0.4;
-        p.b = 1.0;
-      }
+      p.x = myWindow.screenX + myWindow.width  * (0.15 + Math.random() * 0.7);
+      p.y = myWindow.screenY + myWindow.height * (0.15 + Math.random() * 0.7);
+      p.br = br; p.bg = bg; p.bb = bb;
+      p.r  = br; p.g  = bg; p.b  = bb;
     }
   }
 
-  private initialized = false;
-
   update(dt: number, myWindow: WindowInfo, otherWindows: Map<string, WindowInfo>): void {
     if (!this.initialized) {
-      this.spawnParticles(myWindow);
+      this.spawn(myWindow);
       this.initialized = true;
     }
 
-    const winLeft = myWindow.screenX;
-    const winRight = myWindow.screenX + myWindow.width;
-    const winTop = myWindow.screenY;
-    const winBottom = myWindow.screenY + myWindow.height;
-    const winCenterX = myWindow.screenX + myWindow.width / 2;
-    const winCenterY = myWindow.screenY + myWindow.height / 2;
+    const wL = myWindow.screenX;
+    const wR = myWindow.screenX + myWindow.width;
+    const wT = myWindow.screenY;
+    const wB = myWindow.screenY + myWindow.height;
+    const cX = myWindow.screenX + myWindow.width  / 2;
+    const cY = myWindow.screenY + myWindow.height / 2;
 
-    // Gather other window infos as array for interaction
     const others = Array.from(otherWindows.values());
 
     for (const p of this.particles) {
-      // --- Interaction forces with other windows ---
+      // Reset color to base each frame, then accumulate mixing
+      let mixR = 0, mixG = 0, mixB = 0, totalMix = 0;
+
       for (const other of others) {
-        const otherLeft = other.screenX;
-        const otherRight = other.screenX + other.width;
-        const otherTop = other.screenY;
-        const otherBottom = other.screenY + other.height;
-        const otherCenterX = other.screenX + other.width / 2;
-        const otherCenterY = other.screenY + other.height / 2;
+        const oL = other.screenX;
+        const oR = other.screenX + other.width;
+        const oT = other.screenY;
+        const oB = other.screenY + other.height;
 
-        // Determine the closest edge distance between the two windows
-        // Horizontal overlap / gap
-        const hGap = Math.max(0, Math.max(winLeft, otherLeft) - Math.min(winRight, otherRight));
-        // Vertical overlap / gap
-        const vGap = Math.max(0, Math.max(winTop, otherTop) - Math.min(winBottom, otherBottom));
-
+        // Gap between the two window rectangles
+        const hGap = Math.max(0, Math.max(wL, oL) - Math.min(wR, oR));
+        const vGap = Math.max(0, Math.max(wT, oT) - Math.min(wB, oB));
         const edgeDist = Math.sqrt(hGap * hGap + vGap * vGap);
 
         if (edgeDist > INTERACTION_RANGE) continue;
 
-        // Determine particle's distance to the shared edge region
-        // Find the closest point on the other window's bounding rect to this particle
-        const clampedX = Math.max(otherLeft, Math.min(otherRight, p.x));
-        const clampedY = Math.max(otherTop, Math.min(otherBottom, p.y));
-        const dxEdge = p.x - clampedX;
-        const dyEdge = p.y - clampedY;
-        const distToOther = Math.sqrt(dxEdge * dxEdge + dyEdge * dyEdge);
+        // Closest point on other window to this particle
+        const cx = Math.max(oL, Math.min(oR, p.x));
+        const cy = Math.max(oT, Math.min(oB, p.y));
+        const dx = p.x - cx;
+        const dy = p.y - cy;
+        const distToEdge = Math.sqrt(dx * dx + dy * dy);
 
-        if (distToOther > INTERACTION_RANGE) continue;
+        if (distToEdge > INTERACTION_RANGE) continue;
 
-        // Force directed toward the other window's center
-        const dxCenter = otherCenterX - p.x;
-        const dyCenter = otherCenterY - p.y;
-        const distCenter = Math.sqrt(dxCenter * dxCenter + dyCenter * dyCenter) + 1;
+        // windowProximity: 1 = windows touching, 0 = at max range
+        const windowProximity = 1 - edgeDist / INTERACTION_RANGE;
+        // particleProximity: 1 = at edge, 0 = at max range
+        const particleProximity = 1 - distToEdge / INTERACTION_RANGE;
 
-        // Falloff: stronger as windows get closer
-        const proximityFactor = 1.0 - edgeDist / INTERACTION_RANGE;
-        // Particle closeness to edge boosts force
-        const particleFactor = 1.0 - Math.min(distToOther, INTERACTION_RANGE) / INTERACTION_RANGE;
+        // Attraction toward the nearest point on the other window
+        const forceMag = ATTRACTION_K * windowProximity * particleProximity;
+        const len = distToEdge + 1;
+        p.vx -= (dx / len) * forceMag * dt;
+        p.vy -= (dy / len) * forceMag * dt;
 
-        const forceMag = INTERACTION_K * proximityFactor * particleFactor / (distCenter * distCenter + 100);
-
-        p.vx += (dxCenter / distCenter) * forceMag * dt;
-        p.vy += (dyCenter / distCenter) * forceMag * dt;
-
-        // Color shift toward other window interaction (slight pull toward white/bright)
-        p.r = Math.min(1.0, p.r + 0.01 * proximityFactor);
-        p.g = Math.min(1.0, p.g + 0.005 * proximityFactor);
+        // Accumulate color mix contribution
+        const mixWeight = windowProximity * particleProximity;
+        mixR += other.color[0] * mixWeight;
+        mixG += other.color[1] * mixWeight;
+        mixB += other.color[2] * mixWeight;
+        totalMix += mixWeight;
       }
 
-      // --- Gravity toward window center ---
-      const dxC = winCenterX - p.x;
-      const dyC = winCenterY - p.y;
-      const distC = Math.sqrt(dxC * dxC + dyC * dyC) + 1;
-      p.vx += (dxC / distC) * GRAVITY_K * dt * distC * 0.01;
-      p.vy += (dyC / distC) * GRAVITY_K * dt * distC * 0.01;
-
-      // Small random jitter for liveliness
-      p.vx += (Math.random() - 0.5) * 20 * dt;
-      p.vy += (Math.random() - 0.5) * 20 * dt;
-      p.vz += (Math.random() - 0.5) * 10 * dt;
-
-      // Damping
-      p.vx *= 0.98;
-      p.vy *= 0.98;
-      p.vz *= 0.97;
-
-      // Clamp speed
-      const speed = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
-      if (speed > MAX_SPEED) {
-        p.vx = (p.vx / speed) * MAX_SPEED;
-        p.vy = (p.vy / speed) * MAX_SPEED;
+      // Apply color mixing
+      if (totalMix > 0) {
+        const t = Math.min(totalMix, 1.0);
+        const avgR = mixR / totalMix;
+        const avgG = mixG / totalMix;
+        const avgB = mixB / totalMix;
+        p.r = p.br * (1 - t) + avgR * t;
+        p.g = p.bg * (1 - t) + avgG * t;
+        p.b = p.bb * (1 - t) + avgB * t;
+      } else {
+        p.r = p.br; p.g = p.bg; p.b = p.bb;
       }
 
-      // --- Move ---
+      // Gentle gravity toward window center
+      const gdx = cX - p.x;
+      const gdy = cY - p.y;
+      const gdist = Math.sqrt(gdx * gdx + gdy * gdy) + 1;
+      p.vx += gdx * GRAVITY_K * dt;
+      p.vy += gdy * GRAVITY_K * dt;
+
+      // Tiny random jitter for organic motion
+      p.vx += (Math.random() - 0.5) * 12 * dt;
+      p.vy += (Math.random() - 0.5) * 12 * dt;
+      p.vz += (Math.random() - 0.5) *  6 * dt;
+
+      // Damping + speed clamp
+      p.vx *= DAMPING; p.vy *= DAMPING; p.vz *= 0.96;
+      const spd = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
+      if (spd > MAX_SPEED) { p.vx = p.vx / spd * MAX_SPEED; p.vy = p.vy / spd * MAX_SPEED; }
+
+      // Integrate
       p.x += p.vx * dt;
       p.y += p.vy * dt;
       p.z += p.vz * dt;
 
-      // --- Bounce off window edges (screen coords) ---
-      const margin = 10;
-      if (p.x < winLeft + margin) {
-        p.x = winLeft + margin;
-        p.vx = Math.abs(p.vx) * 0.6;
-      }
-      if (p.x > winRight - margin) {
-        p.x = winRight - margin;
-        p.vx = -Math.abs(p.vx) * 0.6;
-      }
-      if (p.y < winTop + margin) {
-        p.y = winTop + margin;
-        p.vy = Math.abs(p.vy) * 0.6;
-      }
-      if (p.y > winBottom - margin) {
-        p.y = winBottom - margin;
-        p.vy = -Math.abs(p.vy) * 0.6;
-      }
-
-      // Z bounce
-      if (p.z < -Z_RANGE) {
-        p.z = -Z_RANGE;
-        p.vz = Math.abs(p.vz) * 0.6;
-      }
-      if (p.z > Z_RANGE) {
-        p.z = Z_RANGE;
-        p.vz = -Math.abs(p.vz) * 0.6;
-      }
+      // Soft bounce off own window edges — particles press against the wall
+      const m = 8;
+      if (p.x < wL + m) { p.x = wL + m; p.vx = Math.abs(p.vx) * 0.5; }
+      if (p.x > wR - m) { p.x = wR - m; p.vx = -Math.abs(p.vx) * 0.5; }
+      if (p.y < wT + m) { p.y = wT + m; p.vy = Math.abs(p.vy) * 0.5; }
+      if (p.y > wB - m) { p.y = wB - m; p.vy = -Math.abs(p.vy) * 0.5; }
+      if (p.z < -Z_RANGE) { p.z = -Z_RANGE; p.vz =  Math.abs(p.vz) * 0.5; }
+      if (p.z >  Z_RANGE) { p.z =  Z_RANGE; p.vz = -Math.abs(p.vz) * 0.5; }
     }
 
     // Update uniforms
     this.material.uniforms.uWindowX.value = myWindow.screenX;
     this.material.uniforms.uWindowY.value = myWindow.screenY;
-    this.material.uniforms.uWidth.value = myWindow.width;
-    this.material.uniforms.uHeight.value = myWindow.height;
+    this.material.uniforms.uWidth.value   = myWindow.width;
+    this.material.uniforms.uHeight.value  = myWindow.height;
 
-    // Write to buffer attributes
-    const posArr = this.positionAttr.array as Float32Array;
-    const colArr = this.colorAttr.array as Float32Array;
+    // Write buffers
+    const posArr  = this.posAttr.array  as Float32Array;
+    const colArr  = this.colAttr.array  as Float32Array;
     const sizeArr = this.sizeAttr.array as Float32Array;
 
     for (let i = 0; i < PARTICLE_COUNT; i++) {
       const p = this.particles[i];
-      posArr[i * 3] = p.x;
+      posArr[i * 3]     = p.x;
       posArr[i * 3 + 1] = p.y;
       posArr[i * 3 + 2] = p.z;
-      colArr[i * 3] = p.r;
+      colArr[i * 3]     = p.r;
       colArr[i * 3 + 1] = p.g;
       colArr[i * 3 + 2] = p.b;
       sizeArr[i] = p.size;
     }
 
-    this.positionAttr.needsUpdate = true;
-    this.colorAttr.needsUpdate = true;
+    this.posAttr.needsUpdate  = true;
+    this.colAttr.needsUpdate  = true;
     this.sizeAttr.needsUpdate = true;
   }
 
