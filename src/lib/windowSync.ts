@@ -55,13 +55,16 @@ export class WindowSync {
   }
 
   private broadcast(): void {
+    // screenY points to the top of the browser frame (title bar).
+    // The canvas lives in the content area, which starts below the chrome.
+    const chromeH = window.outerHeight - window.innerHeight;
     const msg: Message = {
       type: "heartbeat",
       id: this.myId,
       screenX: window.screenX,
-      screenY: window.screenY,
-      width: window.outerWidth,
-      height: window.outerHeight,
+      screenY: window.screenY + chromeH,
+      width: window.innerWidth,
+      height: window.innerHeight,
       color: this.myColor,
     };
     this.channel.postMessage(msg);
@@ -101,12 +104,13 @@ export class WindowSync {
   };
 
   getMyInfo(): WindowInfo {
+    const chromeH = window.outerHeight - window.innerHeight;
     return {
       id: this.myId,
       screenX: window.screenX,
-      screenY: window.screenY,
-      width: window.outerWidth,
-      height: window.outerHeight,
+      screenY: window.screenY + chromeH,
+      width: window.innerWidth,
+      height: window.innerHeight,
       color: this.myColor,
       lastSeen: Date.now(),
     };

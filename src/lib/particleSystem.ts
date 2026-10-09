@@ -15,6 +15,7 @@ uniform float uWindowX;
 uniform float uWindowY;
 uniform float uWidth;
 uniform float uHeight;
+uniform float uPixelRatio;
 attribute float aSize;
 attribute vec3 aColor;
 varying vec3 vColor;
@@ -25,15 +26,15 @@ void main() {
 
   float nx = ((position.x - uWindowX) / uWidth) * 2.0 - 1.0;
   float ny = -(((position.y - uWindowY) / uHeight) * 2.0 - 1.0);
-  float nz = position.z / (float(${Z_RANGE}) * 2.0);
+  float nz = position.z / 600.0;
 
   gl_Position = vec4(nx, ny, nz, 1.0);
 
-  // Depth-based size: closer (z > 0) = bigger
-  float depthScale = 0.6 + 0.4 * ((position.z + float(${Z_RANGE})) / float(${Z_RANGE * 2}));
-  gl_PointSize = aSize * depthScale;
+  // Depth-based size: closer (z > 0) = bigger; scale by devicePixelRatio
+  float depthScale = 0.6 + 0.4 * ((position.z + 300.0) / 600.0);
+  gl_PointSize = aSize * depthScale * uPixelRatio;
 
-  vAlpha = 0.7 + 0.3 * depthScale;
+  vAlpha = 0.85 + 0.15 * depthScale;
 }
 `;
 
@@ -113,10 +114,11 @@ export class ParticleSystem {
       depthTest: false,
       depthWrite: false,
       uniforms: {
-        uWindowX: { value: 0 },
-        uWindowY: { value: 0 },
-        uWidth:   { value: 1 },
-        uHeight:  { value: 1 },
+        uWindowX:    { value: 0 },
+        uWindowY:    { value: 0 },
+        uWidth:      { value: 1 },
+        uHeight:     { value: 1 },
+        uPixelRatio: { value: 1 },
       },
     });
 
@@ -130,7 +132,7 @@ export class ParticleSystem {
         vz: (Math.random() - 0.5) * 30,
         br: 1, bg: 1, bb: 1,
         r: 1, g: 1, b: 1,
-        size: Math.random() * 10 + 14, // 14–24px
+        size: Math.random() * 8 + 18, // 18–26px CSS
       });
     }
   }
@@ -138,8 +140,9 @@ export class ParticleSystem {
   private spawn(myWindow: WindowInfo): void {
     const [br, bg, bb] = myWindow.color;
     for (const p of this.particles) {
-      p.x = myWindow.screenX + myWindow.width  * (0.15 + Math.random() * 0.7);
-      p.y = myWindow.screenY + myWindow.height * (0.15 + Math.random() * 0.7);
+      // Spawn within central 60% of the content area so they're always visible
+      p.x = myWindow.screenX + myWindow.width  * (0.2 + Math.random() * 0.6);
+      p.y = myWindow.screenY + myWindow.height * (0.2 + Math.random() * 0.6);
       p.br = br; p.bg = bg; p.bb = bb;
       p.r  = br; p.g  = bg; p.b  = bb;
     }
@@ -251,10 +254,11 @@ export class ParticleSystem {
     }
 
     // Update uniforms
-    this.material.uniforms.uWindowX.value = myWindow.screenX;
-    this.material.uniforms.uWindowY.value = myWindow.screenY;
-    this.material.uniforms.uWidth.value   = myWindow.width;
-    this.material.uniforms.uHeight.value  = myWindow.height;
+    this.material.uniforms.uWindowX.value    = myWindow.screenX;
+    this.material.uniforms.uWindowY.value    = myWindow.screenY;
+    this.material.uniforms.uWidth.value      = myWindow.width;
+    this.material.uniforms.uHeight.value     = myWindow.height;
+    this.material.uniforms.uPixelRatio.value = window.devicePixelRatio;
 
     // Write buffers
     const posArr  = this.posAttr.array  as Float32Array;
