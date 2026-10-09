@@ -79,6 +79,7 @@ function buildOrbMat(size = 0.020, opacity = 0.85): THREE.PointsMaterial {
   });
 }
 
+// Stream that runs center-to-center: t=0 is our orb origin, t=1 is the other orb's center
 function buildStream(
   worldDir: THREE.Vector3,
   myColor: [number, number, number],
@@ -91,7 +92,7 @@ function buildStream(
   const col   = new Float32Array(count * 3);
 
   const dir   = worldDir.clone().normalize();
-  const reach = worldDir.length();
+  const reach = worldDir.length(); // exact center-to-center distance in world units
 
   const up    = Math.abs(dir.x) < 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0);
   const perp2 = new THREE.Vector3().crossVectors(dir, up).normalize();
@@ -100,26 +101,32 @@ function buildStream(
   const s = time * 0.8;
 
   for (let i = 0; i < count; i++) {
-    const t     = Math.random();
-    const taper = Math.pow(1 - t, 2.0);
-    const width = SPHERE_RADIUS * 0.4 * taper + 0.04;
+    const t = Math.random(); // 0 = our center, 1 = other center
+
+    // sin(t*π): 0 at both ends, 1 at midpoint → lenticular tube shape
+    // Wide where it merges with each orb, narrow in the space between
+    const envelope = Math.sin(t * Math.PI);
+    const width    = SPHERE_RADIUS * 0.22 * envelope + 0.02;
+
     const angle = Math.random() * Math.PI * 2;
-    const r     = Math.pow(Math.random(), 0.8) * width;
+    const r     = Math.pow(Math.random(), 0.6) * width;
 
-    const dist = SPHERE_RADIUS * 0.9 + t * reach;
-    const base = dir.clone().multiplyScalar(dist);
+    // Base position: straight line from center (0,0,0) to worldDir
+    const base = dir.clone().multiplyScalar(t * reach);
 
-    const w1 = Math.sin(s * 3 + t * 6  + i * 0.02) * 0.025;
-    const w2 = Math.cos(s * 2 + t * 4  + i * 0.015) * 0.018;
+    // Gentle undulation perpendicular to the stream axis
+    const w1 = Math.sin(s * 3 + t * Math.PI * 4 + i * 0.02) * 0.018 * strength;
+    const w2 = Math.cos(s * 2 + t * Math.PI * 3 + i * 0.015) * 0.014 * strength;
     base.addScaledVector(perp1, Math.cos(angle) * r + w1);
     base.addScaledVector(perp2, Math.sin(angle) * r + w2);
-    base.addScaledVector(dir,   Math.sin(s * 4 + t * 8) * 0.012);
 
     pos[i * 3]     = base.x;
     pos[i * 3 + 1] = base.y;
     pos[i * 3 + 2] = base.z;
 
-    const fade = (1 - t * 0.7) * strength;
+    // Colour blends from myColor → otherColor along the path
+    // Fade near the ends so it dissolves into each orb naturally
+    const fade = (0.35 + 0.65 * envelope) * strength;
     col[i * 3]     = (myColor[0] * (1 - t) + otherColor[0] * t) * fade;
     col[i * 3 + 1] = (myColor[1] * (1 - t) + otherColor[1] * t) * fade;
     col[i * 3 + 2] = (myColor[2] * (1 - t) + otherColor[2] * t) * fade;
