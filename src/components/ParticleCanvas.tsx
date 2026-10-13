@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { WindowSync } from "@/lib/windowSync";
-import { ParticleSystem, screenScale, isOverlapping, CAMERA_Z, FOV_DEG } from "@/lib/particleSystem";
+import { ParticleSystem, screenScale, isOverlapping, anyInRange, CAMERA_Z, FOV_DEG } from "@/lib/particleSystem";
 import type { GhostInput } from "@/lib/particleSystem";
 
 // Spring-mass constants for inertia
@@ -55,11 +55,15 @@ export default function ParticleCanvas() {
     window.addEventListener("resize", handleResize);
 
     // ── Inertia state ─────────────────────────────────────────────────────────
-    let orbX = 0, orbY = 0;   // world-space displacement from centre
-    let orbVX = 0, orbVY = 0; // velocity (world units / s)
+    let orbX = 0, orbY = 0;
+    let orbVX = 0, orbVY = 0;
 
     let prevSX = window.screenX;
     let prevSY = window.screenY + (window.outerHeight - window.innerHeight);
+
+    // ── Random event timers ───────────────────────────────────────────────────
+    let popTimer   = Math.random() * 6 + 5;   // first pop in 5–11 s
+    let mergeTimer = Math.random() * 8 + 8;   // first merge in 8–16 s
 
     // ── Animation loop ────────────────────────────────────────────────────────
     let last = performance.now();
@@ -99,6 +103,15 @@ export default function ParticleCanvas() {
       orbVY *= damp;
 
       ps.orbGroup.position.set(orbX, orbY, 0);
+
+      // ── Random events ─────────────────────────────────────────────────────
+      popTimer   -= dt;
+      mergeTimer -= dt;
+      if (popTimer   <= 0) { ps.triggerPop();   popTimer   = Math.random() * 7 + 5; }
+      if (mergeTimer <= 0) { ps.triggerMerge(); mergeTimer = Math.random() * 9 + 8; }
+
+      // Proximity scale: subtle grow when nearby windows exist
+      ps.setNearby(anyInRange(myInfo, sync.windows, 500));
 
       // ── Ghost orbs: overlapping lower-z windows appear on our canvas ───────
       const ghosts: GhostInput[] = [];

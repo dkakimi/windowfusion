@@ -1,12 +1,12 @@
 import * as THREE from "three";
 import type { WindowInfo } from "./windowSync";
 
-const ORB_PARTICLES    = 10000;
-const GHOST_PARTICLES  = 3000;
-const GHOST_POOL_SIZE  = 8;
-const SPHERE_RADIUS    = 1.8;
+const ORB_PARTICLES   = 3000;
+const GHOST_PARTICLES = 1200;
+const GHOST_POOL_SIZE = 8;
+const SPHERE_RADIUS   = 1.8;
 const NUCLEUS_FRACTION = 0.5;
-const STREAM_PARTICLES = 3000;
+const STREAM_PARTICLES = 4000;
 const STREAM_RANGE_PX  = 500;
 export const CAMERA_Z  = 5;
 export const FOV_DEG   = 75;
@@ -28,217 +28,259 @@ export function isOverlapping(a: WindowInfo, b: WindowInfo): boolean {
   );
 }
 
-// ─── Shaders ─────────────────────────────────────────────────────────────────
+export function anyInRange(myWin: WindowInfo, others: Map<string, WindowInfo>, rangePx: number): boolean {
+  for (const [, other] of others) {
+    if (edgeDistPx(myWin, other) <= rangePx) return true;
+  }
+  return false;
+}
 
-// Main orb: GPU blob deformation via multi-frequency sine displacement
+// ─── Shaders ──────────────────────────────────────────────────────────────────
+
+// Soap bubble fragment shader — shared between main orb and ghost (different uniforms)
+const BUBBLE_FRAG = /* glsl */`
+uniform float uTime;
+uniform vec3  uBaseColor;
+uniform float uFade;
+
+void main() {
+  vec2  uv = gl_PointCoord * 2.0 - 1.0;
+  float r  = dot(uv, uv);
+  if (r > 1.0) discard;
+
+  float z    = sqrt(max(0.0, 1.0 - r));
+  vec3  norm = normalize(vec3(uv, z));
+  vec3  view = vec3(0.0, 0.0, 1.0);
+
+  // Fresnel rim (more visible at grazing angles)
+  float fresnel = 1.0 - z;
+  float rim     = pow(fresnel, 1.4);
+
+  // Thin-film iridescence: rainbow shifts with angle + time
+  float phase = rim * 5.2 + uTime * 0.5;
+  vec3 irid = vec3(
+    sin(phase)         * 0.5 + 0.5,
+    sin(phase + 2.094) * 0.5 + 0.5,
+    sin(phase + 4.189) * 0.5 + 0.5
+  );
+
+  // Specular highlight
+  vec3  light = normalize(vec3(0.6, 0.9, 1.0));
+  float spec  = pow(max(dot(reflect(-light, norm), view), 0.0), 22.0);
+
+  // Blend: base tint at center → iridescence at rim
+  vec3 col = mix(uBaseColor * 0.2, irid * 0.9 + uBaseColor * 0.35, rim * 0.88);
+  col += spec * 0.95;
+
+  float alpha = pow(rim, 1.2) * 0.92 + spec * 0.85 + 0.025;
+  alpha = clamp(alpha * uFade, 0.0, 1.0);
+  if (alpha < 0.01) discard;
+
+  gl_FragColor = vec4(col, alpha);
+}`;
+
+// Main orb vertex: blob deformation + pop burst (particles fly outward)
 const ORB_VERT = /* glsl */`
 uniform float uTime;
 uniform float uHeight;
-attribute vec3 color;
-varying vec3 vColor;
+uniform float uPop;
 
 void main() {
-  vColor = color;
-
-  // Organic multi-frequency surface displacement
   vec3 n = normalize(position);
   float d =
     sin(n.x * 3.1 + uTime * 0.80) * cos(n.y * 2.6 + uTime * 0.60) * 0.16 +
-    sin(n.y * 2.9 + n.z * 2.1   + uTime * 1.00) * 0.11 +
+    sin(n.y * 2.9 + n.z * 2.1    + uTime * 1.00) * 0.11 +
     cos(n.z * 3.4 + uTime * 0.50) * sin(n.x * 2.2 + uTime * 0.90) * 0.09 +
-    sin(n.x * 1.7 + n.z * 2.8   + uTime * 0.65) * 0.06;
+    sin(n.x * 1.7 + n.z * 2.8    + uTime * 0.65) * 0.06;
 
   vec3 blobPos = position * (1.0 + d);
-  vec4 mvPos   = modelViewMatrix * vec4(blobPos, 1.0);
+  // Pop burst: particles scatter outward
+  blobPos += n * uPop * 5.5;
 
+  vec4 mvPos = modelViewMatrix * vec4(blobPos, 1.0);
   gl_Position  = projectionMatrix * mvPos;
-  gl_PointSize = 0.020 * projectionMatrix[1][1] * uHeight * 0.5 / (-mvPos.z);
+  gl_PointSize = 0.032 * projectionMatrix[1][1] * uHeight * 0.5 / (-mvPos.z);
 }`;
 
-const ORB_FRAG = /* glsl */`
-varying vec3 vColor;
-void main() {
-  vec2  uv = gl_PointCoord - 0.5;
-  float r2 = dot(uv, uv);
-  if (r2 > 0.25) discard;
-  gl_FragColor = vec4(vColor, (1.0 - r2 * 4.0) * 0.85);
-}`;
-
-// Ghost orb: lighter blob, colour driven by uniform (pre-allocated pool)
+// Ghost orb vertex: lighter blob frequencies
 const GHOST_VERT = /* glsl */`
 uniform float uTime;
 uniform float uHeight;
-attribute float aDensity;
-varying float vDensity;
 
 void main() {
-  vDensity = aDensity;
   vec3 n = normalize(position);
   float d =
-    sin(n.x * 2.5 + uTime * 0.65) * cos(n.y * 2.1 + uTime * 0.50) * 0.11 +
-    cos(n.z * 2.8 + uTime * 0.70) * sin(n.y * 1.9 + uTime * 0.55) * 0.08;
+    sin(n.x * 2.5 + uTime * 0.65) * cos(n.y * 2.1 + uTime * 0.50) * 0.12 +
+    cos(n.z * 2.8 + uTime * 0.70) * sin(n.y * 1.9 + uTime * 0.55) * 0.09;
   vec3 blobPos = position * (1.0 + d);
   vec4 mvPos   = modelViewMatrix * vec4(blobPos, 1.0);
   gl_Position  = projectionMatrix * mvPos;
-  gl_PointSize = 0.018 * projectionMatrix[1][1] * uHeight * 0.5 / (-mvPos.z);
+  gl_PointSize = 0.026 * projectionMatrix[1][1] * uHeight * 0.5 / (-mvPos.z);
 }`;
 
+// Ghost fragment: same soap bubble look but driven by uColor uniform
 const GHOST_FRAG = /* glsl */`
+uniform float uTime;
 uniform vec3  uColor;
-varying float vDensity;
+uniform float uFade;
+
 void main() {
-  vec2  uv = gl_PointCoord - 0.5;
-  float r2 = dot(uv, uv);
-  if (r2 > 0.25) discard;
-  gl_FragColor = vec4(uColor, (1.0 - r2 * 4.0) * 0.72 * vDensity);
+  vec2  uv = gl_PointCoord * 2.0 - 1.0;
+  float r  = dot(uv, uv);
+  if (r > 1.0) discard;
+
+  float z    = sqrt(max(0.0, 1.0 - r));
+  vec3  norm = normalize(vec3(uv, z));
+  vec3  view = vec3(0.0, 0.0, 1.0);
+
+  float fresnel = 1.0 - z;
+  float rim     = pow(fresnel, 1.4);
+
+  float phase = rim * 5.2 + uTime * 0.5;
+  vec3 irid = vec3(
+    sin(phase)         * 0.5 + 0.5,
+    sin(phase + 2.094) * 0.5 + 0.5,
+    sin(phase + 4.189) * 0.5 + 0.5
+  );
+
+  vec3  light = normalize(vec3(0.6, 0.9, 1.0));
+  float spec  = pow(max(dot(reflect(-light, norm), view), 0.0), 22.0);
+
+  vec3 col = mix(uColor * 0.18, irid * 0.85 + uColor * 0.35, rim * 0.88);
+  col += spec * 0.85;
+
+  float alpha = pow(rim, 1.2) * 0.78 + spec * 0.7 + 0.02;
+  alpha = clamp(alpha * uFade, 0.0, 1.0);
+  if (alpha < 0.01) discard;
+
+  gl_FragColor = vec4(col, alpha);
 }`;
 
-// ─── Geometry builders ────────────────────────────────────────────────────────
+// Stream vertex: per-particle size attribute
+const STREAM_VERT = /* glsl */`
+attribute vec3  color;
+attribute float aSize;
+uniform   float uHeight;
+varying   vec3  vColor;
 
-function buildOrbGeo(
-  myColor: [number, number, number],
-  otherColors: [number, number, number][]
-): THREE.BufferGeometry {
-  const n   = ORB_PARTICLES;
-  const pos = new Float32Array(n * 3);
-  const col = new Float32Array(n * 3);
-  const nuc = Math.floor(n * NUCLEUS_FRACTION);
-  const all = [myColor, ...otherColors];
+void main() {
+  vColor       = color;
+  vec4 mvPos   = modelViewMatrix * vec4(position, 1.0);
+  gl_PointSize = aSize * projectionMatrix[1][1] * uHeight * 0.5 / (-mvPos.z);
+  gl_Position  = projectionMatrix * mvPos;
+}`;
 
-  for (let i = 0; i < n; i++) {
-    let radius: number, density: number;
-    if (i < nuc) {
-      radius  = SPHERE_RADIUS * 0.4 * Math.pow(Math.random(), 0.3);
-      density = 1.0;
-    } else {
-      radius  = SPHERE_RADIUS * 0.6 + SPHERE_RADIUS * 0.5 * Math.pow(Math.random(), 0.5);
-      density = 0.65;
-    }
-    const phi = Math.random() * Math.PI * 2;
-    const th  = Math.acos(2 * Math.random() - 1);
-    pos[i*3]   = radius * Math.sin(th) * Math.cos(phi);
-    pos[i*3+1] = radius * Math.sin(th) * Math.sin(phi);
-    pos[i*3+2] = radius * Math.cos(th);
+// Stream fragment: iridescent soap-bubble beads flowing between orbs
+const STREAM_FRAG = /* glsl */`
+uniform float uTime;
+varying vec3  vColor;
 
-    const c = (i < nuc && all.length > 1) ? all[i % all.length] : myColor;
-    col[i*3]   = c[0] * density;
-    col[i*3+1] = c[1] * density;
-    col[i*3+2] = c[2] * density;
-  }
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
-  geo.setAttribute("color",    new THREE.BufferAttribute(col, 3));
-  return geo;
-}
+void main() {
+  vec2  uv = gl_PointCoord * 2.0 - 1.0;
+  float r  = dot(uv, uv);
+  if (r > 1.0) discard;
 
-// Ghost geometry: sphere positions + density attribute (colour comes from uniform)
-function buildGhostGeo(): THREE.BufferGeometry {
-  const n   = GHOST_PARTICLES;
-  const pos = new Float32Array(n * 3);
-  const den = new Float32Array(n);
-  const nuc = Math.floor(n * NUCLEUS_FRACTION);
+  float z    = sqrt(max(0.0, 1.0 - r));
+  vec3  norm = normalize(vec3(uv, z));
+  vec3  view = vec3(0.0, 0.0, 1.0);
 
-  for (let i = 0; i < n; i++) {
-    let radius: number;
-    den[i] = i < nuc ? 1.0 : 0.65;
-    if (i < nuc) {
-      radius = SPHERE_RADIUS * 0.4 * Math.pow(Math.random(), 0.3);
-    } else {
-      radius = SPHERE_RADIUS * 0.6 + SPHERE_RADIUS * 0.5 * Math.pow(Math.random(), 0.5);
-    }
-    const phi = Math.random() * Math.PI * 2;
-    const th  = Math.acos(2 * Math.random() - 1);
-    pos[i*3]   = radius * Math.sin(th) * Math.cos(phi);
-    pos[i*3+1] = radius * Math.sin(th) * Math.sin(phi);
-    pos[i*3+2] = radius * Math.cos(th);
-  }
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
-  geo.setAttribute("aDensity", new THREE.BufferAttribute(den, 1));
-  return geo;
-}
+  float fresnel = 1.0 - z;
+  float rim     = pow(fresnel, 1.4);
 
-// Shared time/height uniforms — update once, all ghost materials see the change
+  float phase = rim * 4.8 + uTime * 0.75;
+  vec3 irid = vec3(
+    sin(phase)         * 0.5 + 0.5,
+    sin(phase + 2.094) * 0.5 + 0.5,
+    sin(phase + 4.189) * 0.5 + 0.5
+  );
+
+  vec3  light = normalize(vec3(0.6, 0.9, 1.0));
+  float spec  = pow(max(dot(reflect(-light, norm), view), 0.0), 18.0);
+
+  vec3 col = mix(vColor * 0.45, irid * 0.85 + vColor * 0.5, rim * 0.80);
+  col += spec * 0.75;
+
+  float alpha = rim * 0.88 + spec * 0.70 + 0.06;
+  alpha = clamp(alpha, 0.0, 1.0);
+  if (alpha < 0.01) discard;
+
+  gl_FragColor = vec4(col, alpha);
+}`;
+
+// ─── Shared uniforms ──────────────────────────────────────────────────────────
+
 const sharedTime:   THREE.IUniform = { value: 0 };
 const sharedHeight: THREE.IUniform = { value: 900 };
 
-function buildOrbMat(): THREE.ShaderMaterial {
-  return new THREE.ShaderMaterial({
-    vertexShader: ORB_VERT, fragmentShader: ORB_FRAG,
-    transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
-    uniforms: {
-      uTime:   { value: 0 },    // per-orb (updated in update())
-      uHeight: { value: 900 },  // per-orb
-    },
-  });
+// ─── Geometry builders ────────────────────────────────────────────────────────
+
+function buildSphereGeo(count: number): THREE.BufferGeometry {
+  const pos = new Float32Array(count * 3);
+  const nuc = Math.floor(count * NUCLEUS_FRACTION);
+  for (let i = 0; i < count; i++) {
+    const r = i < nuc
+      ? SPHERE_RADIUS * 0.4 * Math.pow(Math.random(), 0.3)
+      : SPHERE_RADIUS * 0.6 + SPHERE_RADIUS * 0.5 * Math.pow(Math.random(), 0.5);
+    const phi = Math.random() * Math.PI * 2;
+    const th  = Math.acos(2 * Math.random() - 1);
+    pos[i*3]   = r * Math.sin(th) * Math.cos(phi);
+    pos[i*3+1] = r * Math.sin(th) * Math.sin(phi);
+    pos[i*3+2] = r * Math.cos(th);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  return geo;
 }
 
-function buildGhostMat(color: [number, number, number]): THREE.ShaderMaterial {
-  return new THREE.ShaderMaterial({
-    vertexShader: GHOST_VERT, fragmentShader: GHOST_FRAG,
-    transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
-    uniforms: {
-      uTime:   sharedTime,    // shared — updated once per frame
-      uHeight: sharedHeight,  // shared
-      uColor:  { value: new THREE.Color(...color) },
-    },
-  });
-}
-
-// ─── Stream ───────────────────────────────────────────────────────────────────
-
-function buildStream(
+function buildStreamGeo(
   worldDir: THREE.Vector3,
-  myColor: [number, number, number],
+  myColor:    [number, number, number],
   otherColor: [number, number, number],
-  time: number,
-  strength: number
-): THREE.Points {
-  const count = Math.max(60, Math.floor(STREAM_PARTICLES * strength));
+  time:       number,
+  strength:   number,
+): THREE.BufferGeometry {
+  const count = Math.max(80, Math.floor(STREAM_PARTICLES * strength));
   const pos   = new Float32Array(count * 3);
   const col   = new Float32Array(count * 3);
+  const siz   = new Float32Array(count);
 
   const dir   = worldDir.clone().normalize();
   const reach = worldDir.length();
-
   const up    = Math.abs(dir.x) < 0.9 ? new THREE.Vector3(1,0,0) : new THREE.Vector3(0,1,0);
   const perp2 = new THREE.Vector3().crossVectors(dir, up).normalize();
   const perp1 = new THREE.Vector3().crossVectors(perp2, dir).normalize();
-  const s = time * 0.8;
+  const s     = time * 1.4;
 
   for (let i = 0; i < count; i++) {
     const t        = Math.random();
     const envelope = Math.sin(t * Math.PI);
-    const width    = SPHERE_RADIUS * 0.22 * envelope + 0.02;
+    const width    = SPHERE_RADIUS * 0.60 * envelope + 0.05;
     const angle    = Math.random() * Math.PI * 2;
-    const r        = Math.pow(Math.random(), 0.6) * width;
+    const r        = Math.pow(Math.random(), 0.5) * width;
 
     const base = dir.clone().multiplyScalar(t * reach);
-    const w1   = Math.sin(s*3 + t*Math.PI*4 + i*0.02) * 0.018 * strength;
-    const w2   = Math.cos(s*2 + t*Math.PI*3 + i*0.015) * 0.014 * strength;
+    // Corkscrew swirl
+    const swirl = s * 2.2 + t * Math.PI * 3.5;
+    const w1 = Math.sin(swirl + i * 0.03)      * 0.03 * strength;
+    const w2 = Math.cos(swirl * 0.75 + i * 0.02) * 0.025 * strength;
     base.addScaledVector(perp1, Math.cos(angle)*r + w1);
     base.addScaledVector(perp2, Math.sin(angle)*r + w2);
 
     pos[i*3]   = base.x; pos[i*3+1] = base.y; pos[i*3+2] = base.z;
 
-    const fade = (0.35 + 0.65*envelope) * strength;
+    const fade = (0.38 + 0.62 * envelope) * strength;
     col[i*3]   = (myColor[0]*(1-t) + otherColor[0]*t) * fade;
     col[i*3+1] = (myColor[1]*(1-t) + otherColor[1]*t) * fade;
     col[i*3+2] = (myColor[2]*(1-t) + otherColor[2]*t) * fade;
+
+    siz[i] = 0.020 + Math.random() * 0.024;
   }
+
   const geo = new THREE.BufferGeometry();
   geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
   geo.setAttribute("color",    new THREE.BufferAttribute(col, 3));
-  return new THREE.Points(geo, new THREE.PointsMaterial({
-    size: 0.016, sizeAttenuation: true, vertexColors: true,
-    transparent: true, opacity: 0.9,
-    blending: THREE.AdditiveBlending, depthWrite: false,
-  }));
-}
-
-function disposePoints(p: THREE.Points) {
-  p.geometry.dispose();
-  (p.material as THREE.Material).dispose();
+  geo.setAttribute("aSize",    new THREE.BufferAttribute(siz, 1));
+  return geo;
 }
 
 // ─── Ghost pool ───────────────────────────────────────────────────────────────
@@ -247,13 +289,21 @@ interface PoolSlot { points: THREE.Points; mat: THREE.ShaderMaterial }
 
 class GhostPool {
   private slots: PoolSlot[];
-  private assigned = new Map<string, number>(); // window id → slot index
+  private assigned = new Map<string, number>();
 
   constructor(private group: THREE.Group) {
-    // Pre-build all ghost orb geometries and materials at startup — zero GC later
     this.slots = Array.from({ length: GHOST_POOL_SIZE }, () => {
-      const mat    = buildGhostMat([1, 1, 1]);
-      const points = new THREE.Points(buildGhostGeo(), mat);
+      const mat = new THREE.ShaderMaterial({
+        vertexShader: GHOST_VERT, fragmentShader: GHOST_FRAG,
+        transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
+        uniforms: {
+          uTime:   sharedTime,
+          uHeight: sharedHeight,
+          uColor:  { value: new THREE.Color(1, 1, 1) },
+          uFade:   { value: 1.0 },
+        },
+      });
+      const points = new THREE.Points(buildSphereGeo(GHOST_PARTICLES), mat);
       points.visible = false;
       group.add(points);
       return { points, mat };
@@ -282,11 +332,11 @@ class GhostPool {
     }
   }
 
-  tickRotation(dt: number, time: number): void {
+  tick(dt: number, time: number): void {
     for (const [, idx] of this.assigned) {
       const p = this.slots[idx].points;
-      p.rotation.y += dt * 0.4;
-      p.rotation.x  = Math.sin(time * 0.25 + idx) * 0.12;
+      p.rotation.y += dt * 0.38;
+      p.rotation.x  = Math.sin(time * 0.24 + idx) * 0.11;
     }
   }
 }
@@ -299,48 +349,102 @@ export interface GhostInput {
   worldPos: THREE.Vector3;
 }
 
+type PopPhase  = "idle" | "burst" | "pause" | "reform";
+type GrowPhase = "idle" | "grow"  | "shrink";
+
 export class ParticleSystem {
   readonly orbGroup   = new THREE.Group();
   readonly ghostGroup = new THREE.Group();
 
   private orb: THREE.Points;
   private orbMat: THREE.ShaderMaterial;
+  private streamMat: THREE.ShaderMaterial;
   private ghostPool: GhostPool;
-  private streams  = new Map<string, THREE.Points>();
+  private streams = new Map<string, THREE.Points>();
 
-  private time             = 0;
+  private time    = 0;
   private myColor: [number, number, number] = [1, 1, 1];
-  private prevConnectedKey = "";
+
+  // Pop animation
+  private popPhase: PopPhase = "idle";
+  private popTimer = 0;
+
+  // Grow/merge animation
+  private growPhase: GrowPhase = "idle";
+  private growTimer = 0;
+
+  // Proximity-based subtle scale
+  private proxScale       = 1.0;
+  private targetProxScale = 1.0;
 
   constructor() {
-    this.orbMat  = buildOrbMat();
-    this.orb     = new THREE.Points(buildOrbGeo([1,1,1],[]), this.orbMat);
+    this.orbMat = new THREE.ShaderMaterial({
+      vertexShader: ORB_VERT, fragmentShader: BUBBLE_FRAG,
+      transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
+      uniforms: {
+        uTime:      { value: 0 },
+        uHeight:    { value: 900 },
+        uBaseColor: { value: new THREE.Color(1, 1, 1) },
+        uPop:       { value: 0 },
+        uFade:      { value: 1 },
+      },
+    });
+    this.orb = new THREE.Points(buildSphereGeo(ORB_PARTICLES), this.orbMat);
     this.orbGroup.add(this.orb);
+
+    this.streamMat = new THREE.ShaderMaterial({
+      vertexShader: STREAM_VERT, fragmentShader: STREAM_FRAG,
+      transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
+      uniforms: { uTime: sharedTime, uHeight: sharedHeight },
+    });
+
     this.ghostPool = new GhostPool(this.ghostGroup);
   }
 
   init(color: [number, number, number]): void {
     this.myColor = color;
-    this.orb.geometry.dispose();
-    this.orb.geometry = buildOrbGeo(color, []);
+    this.orbMat.uniforms.uBaseColor.value.setRGB(...color);
+  }
+
+  triggerPop(): void {
+    if (this.popPhase !== "idle") return;
+    this.popPhase = "burst";
+    this.popTimer = 0;
+  }
+
+  triggerMerge(): void {
+    if (this.growPhase !== "idle" || this.popPhase !== "idle") return;
+    this.growPhase = "grow";
+    this.growTimer = 0;
+  }
+
+  setNearby(hasNearby: boolean): void {
+    this.targetProxScale = hasNearby ? 1.18 : 1.0;
   }
 
   update(dt: number, myWindow: WindowInfo, otherWindows: Map<string, WindowInfo>): void {
     this.time += dt;
 
-    // Blob shader time + height
     const physH = myWindow.height * (typeof window !== "undefined" ? window.devicePixelRatio : 1);
     this.orbMat.uniforms.uTime.value   = this.time;
     this.orbMat.uniforms.uHeight.value = physH;
-    sharedTime.value   = this.time;   // updates all ghost materials
+    sharedTime.value   = this.time;
     sharedHeight.value = physH;
 
+    // Update all animations and compute final scale
+    this.updatePop(dt);
+    this.proxScale += (this.targetProxScale - this.proxScale) * Math.min(dt * 3.5, 1.0);
+    const finalScale = this.proxScale * this.getGrowScale(dt);
+    if (this.popPhase === "idle") {
+      this.orbGroup.scale.setScalar(finalScale);
+    }
+
     // Orb spin
-    this.orb.rotation.y += dt * 0.5;
-    this.orb.rotation.x  = Math.sin(this.time * 0.3) * 0.15;
+    this.orb.rotation.y += dt * 0.38;
+    this.orb.rotation.x  = Math.sin(this.time * 0.27) * 0.11;
+    this.ghostPool.tick(dt, this.time);
 
-    this.ghostPool.tickRotation(dt, this.time);
-
+    // Streams
     const scale = screenScale(myWindow.height);
     const myCX  = myWindow.screenX + myWindow.width  * 0.5;
     const myCY  = myWindow.screenY + myWindow.height * 0.5;
@@ -351,39 +455,100 @@ export class ParticleSystem {
     for (const [id, other] of otherWindows) {
       const gap = edgeDistPx(myWindow, other);
       if (gap > STREAM_RANGE_PX) continue;
-      const dx       = (other.screenX + other.width  * 0.5 - myCX) * scale;
-      const dy       = -(other.screenY + other.height * 0.5 - myCY) * scale;
-      const dir      = new THREE.Vector3(dx, dy, 0);
-      const strength = Math.pow(1 - gap / STREAM_RANGE_PX, 0.6);
+      const dx      = (other.screenX + other.width  * 0.5 - myCX) * scale;
+      const dy      = -(other.screenY + other.height * 0.5 - myCY) * scale;
+      const dir     = new THREE.Vector3(dx, dy, 0);
+      const strength = Math.pow(1 - gap / STREAM_RANGE_PX, 0.55);
       close.push({ id, info: other, dir, strength });
     }
 
-    // Rebuild nucleus colours when connected set changes
-    const connKey = close.map(c => c.id).sort().join(",");
-    if (connKey !== this.prevConnectedKey) {
-      this.prevConnectedKey = connKey;
-      this.orb.geometry.dispose();
-      this.orb.geometry = buildOrbGeo(this.myColor, close.map(c => c.info.color));
-    }
-
-    // Streams
     for (const [id, stream] of this.streams) {
       if (!close.find(c => c.id === id)) {
-        this.orbGroup.remove(stream); disposePoints(stream); this.streams.delete(id);
+        this.orbGroup.remove(stream);
+        stream.geometry.dispose();
+        this.streams.delete(id);
       }
     }
     for (const { id, info, dir, strength } of close) {
       if (this.streams.has(id)) {
         const old = this.streams.get(id)!;
-        this.orbGroup.remove(old); disposePoints(old);
+        this.orbGroup.remove(old);
+        old.geometry.dispose();
       }
-      const s = buildStream(dir, this.myColor, info.color, this.time, strength);
+      const geo = buildStreamGeo(dir, this.myColor, info.color, this.time, strength);
+      const s   = new THREE.Points(geo, this.streamMat);
       this.streams.set(id, s);
       this.orbGroup.add(s);
     }
   }
 
-  /** Render overlapping lower-z windows as ghosts (no GC — uses pre-allocated pool) */
+  private updatePop(dt: number): void {
+    if (this.popPhase === "idle") return;
+    this.popTimer += dt;
+
+    if (this.popPhase === "burst") {
+      const p = Math.min(this.popTimer / 0.40, 1.0);
+      this.orbMat.uniforms.uPop.value  = p;
+      this.orbMat.uniforms.uFade.value = 1.0 - p;
+      if (p >= 1.0) {
+        this.popPhase = "pause";
+        this.popTimer = 0;
+        this.orbGroup.visible = false;
+      }
+    } else if (this.popPhase === "pause") {
+      if (this.popTimer >= 0.14) {
+        this.popPhase = "reform";
+        this.popTimer = 0;
+        this.orbMat.uniforms.uPop.value  = 0;
+        this.orbMat.uniforms.uFade.value = 1;
+        this.orbGroup.visible = true;
+        this.orbGroup.scale.setScalar(0);
+      }
+    } else if (this.popPhase === "reform") {
+      const p = Math.min(this.popTimer / 0.65, 1.0);
+      // Damped spring: grows from 0 → overshoots → settles at 1
+      const e     = Math.exp(-p * 5.0);
+      const scale = Math.max(0, 1.0 - e * Math.cos(p * 9.0));
+      this.orbGroup.scale.setScalar(scale * this.proxScale * this.getGrowScale(0));
+      if (p >= 1.0) {
+        this.popPhase = "idle";
+      }
+    }
+  }
+
+  private getGrowScale(dt: number): number {
+    if (this.growPhase === "idle") return 1.0;
+
+    this.growTimer += dt;
+
+    if (this.growPhase === "grow") {
+      const p = Math.min(this.growTimer / 0.45, 1.0);
+      // Ease in-out cubic
+      const ease = p < 0.5 ? 4*p*p*p : 1 - Math.pow(-2*p + 2, 3) / 2;
+      if (p >= 1.0) {
+        this.growPhase = "shrink";
+        this.growTimer = 0;
+        return 1.5;
+      }
+      return 1.0 + 0.5 * ease;
+    }
+
+    if (this.growPhase === "shrink") {
+      const p = Math.min(this.growTimer / 0.80, 1.0);
+      // Elastic spring back: 1.5 → 1.0 with bounce
+      const e     = Math.exp(-p * 6.0);
+      const scale = 1.0 + 0.5 * e * Math.cos(p * 10.0);
+      if (p >= 1.0) {
+        this.growPhase = "idle";
+        this.growTimer = 0;
+        return 1.0;
+      }
+      return Math.max(0.8, scale);
+    }
+
+    return 1.0;
+  }
+
   updateGhosts(inputs: GhostInput[]): void {
     const activeIds = new Set(inputs.map(i => i.id));
     this.ghostPool.releaseStale(activeIds);
@@ -395,6 +560,7 @@ export class ParticleSystem {
   dispose(): void {
     this.orb.geometry.dispose();
     this.orbMat.dispose();
-    for (const [, s] of this.streams) disposePoints(s);
+    this.streamMat.dispose();
+    for (const [, s] of this.streams) s.geometry.dispose();
   }
 }
