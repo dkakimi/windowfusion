@@ -9,9 +9,13 @@ export interface WindowInfo {
   lastSeen: number;
 }
 
-type Message =
+type HeartbeatMessage =
   | { type: "heartbeat"; id: string; screenX: number; screenY: number; width: number; height: number; color: [number, number, number]; focusedAt: number }
   | { type: "leave"; id: string };
+
+export type FusionEvent =
+  | { type: "fusion";     survivorId: string; victimId: string }
+  | { type: "annihilate"; id1: string;        id2: string };
 
 function hslToRgb(h: number, s: number, l: number): [number, number, number] {
   const a = s * Math.min(l, 1 - l);
@@ -33,19 +37,27 @@ export class WindowSync {
   readonly myColor: [number, number, number];
   windows: Map<string, WindowInfo>;
   onWindowsChange?: (windows: Map<string, WindowInfo>) => void;
+  onFusionEvent?:   (event: FusionEvent) => void;
 
-  private channel: BroadcastChannel;
+  private channel:       BroadcastChannel;
+  private eventsChannel: BroadcastChannel;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-  private cleanupTimer: ReturnType<typeof setInterval> | null = null;
+  private cleanupTimer:   ReturnType<typeof setInterval> | null = null;
   private focusedAt: number;
 
   constructor() {
-    this.myId = crypto.randomUUID();
-    this.myColor = idToColor(this.myId);
+    this.myId      = crypto.randomUUID();
+    this.myColor   = idToColor(this.myId);
     this.focusedAt = Date.now();
-    this.windows = new Map();
+    this.windows   = new Map();
+
     this.channel = new BroadcastChannel("windowfusion");
     this.channel.addEventListener("message", this.handleMessage);
+
+    this.eventsChannel = new BroadcastChannel("windowfusion-events");
+    this.eventsChannel.addEventListener("message", (e: MessageEvent<FusionEvent>) => {
+      this.onFusionEvent?.(e.data);
+    });
 
     window.addEventListener("focus",       this.handleFocus);
     window.addEventListener("beforeunload", this.handleUnload);
@@ -55,6 +67,14 @@ export class WindowSync {
     this.broadcast();
   }
 
+  sendFusion(survivorId: string, victimId: string): void {
+    this.eventsChannel.postMessage({ type: "fusion", survivorId, victimId } satisfies FusionEvent);
+  }
+
+  sendAnnihilate(id1: string, id2: string): void {
+    this.eventsChannel.postMessage({ type: "annihilate", id1, id2 } satisfies FusionEvent);
+  }
+
   private handleFocus = () => {
     this.focusedAt = Date.now();
     this.broadcast();
@@ -62,7 +82,7 @@ export class WindowSync {
 
   private broadcast(): void {
     const chromeH = window.outerHeight - window.innerHeight;
-    const msg: Message = {
+    const msg: HeartbeatMessage = {
       type: "heartbeat",
       id: this.myId,
       screenX: window.screenX,
@@ -75,7 +95,7 @@ export class WindowSync {
     this.channel.postMessage(msg);
   }
 
-  private handleMessage = (e: MessageEvent<Message>): void => {
+  private handleMessage = (e: MessageEvent<HeartbeatMessage>): void => {
     const d = e.data;
     if (d.type === "heartbeat") {
       const isNew = !this.windows.has(d.id);
@@ -101,7 +121,7 @@ export class WindowSync {
   }
 
   private handleUnload = () => {
-    this.channel.postMessage({ type: "leave", id: this.myId } satisfies Message);
+    this.channel.postMessage({ type: "leave", id: this.myId } satisfies HeartbeatMessage);
     this.destroy();
   };
 
@@ -126,5 +146,6 @@ export class WindowSync {
     window.removeEventListener("beforeunload", this.handleUnload);
     this.channel.removeEventListener("message", this.handleMessage);
     this.channel.close();
+    this.eventsChannel.close();
   }
 }
