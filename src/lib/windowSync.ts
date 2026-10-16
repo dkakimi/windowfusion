@@ -7,14 +7,29 @@ export interface WindowInfo {
   color: [number, number, number];
   focusedAt: number;
   lastSeen: number;
+  // Bubble state (px, px/s)
+  radius: number;
+  vx: number;
+  vy: number;
+  alive: boolean;
+  immuneUntil: number;   // wall-clock ms; no merges before this
+  sentAt: number;
+}
+
+export interface BubbleState {
+  radius: number;
+  vx: number;
+  vy: number;
+  alive: boolean;
+  immuneUntil: number;
 }
 
 type HeartbeatMessage =
-  | { type: "heartbeat"; id: string; screenX: number; screenY: number; width: number; height: number; color: [number, number, number]; focusedAt: number }
+  | ({ type: "heartbeat" } & Omit<WindowInfo, "lastSeen">)
   | { type: "leave"; id: string };
 
 export type FusionEvent =
-  | { type: "fusion";     survivorId: string; victimId: string }
+  | { type: "fusion";     survivorId: string; victimId: string; victimRadius: number }
   | { type: "annihilate"; id1: string;        id2: string };
 
 function hslToRgb(h: number, s: number, l: number): [number, number, number] {
@@ -32,6 +47,16 @@ function idToColor(id: string): [number, number, number] {
   return hslToRgb((hash % 360) / 360, 1.0, 0.65);
 }
 
+// Center of a window's content area, extrapolated by its last known velocity so
+// remote bubbles move smoothly between heartbeats.
+export function predictCenter(info: WindowInfo, now = Date.now()): [number, number] {
+  const dt = Math.min(Math.max(now - info.sentAt, 0), 300) / 1000;
+  return [
+    info.screenX + info.width  * 0.5 + info.vx * dt,
+    info.screenY + info.height * 0.5 + info.vy * dt,
+  ];
+}
+
 export class WindowSync {
   readonly myId: string;
   readonly myColor: [number, number, number];
@@ -44,6 +69,7 @@ export class WindowSync {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private cleanupTimer:   ReturnType<typeof setInterval> | null = null;
   private focusedAt: number;
+  private state: BubbleState = { radius: 0, vx: 0, vy: 0, alive: true, immuneUntil: 0 };
 
   constructor() {
     this.myId      = crypto.randomUUID();
@@ -60,19 +86,35 @@ export class WindowSync {
     });
 
     window.addEventListener("focus",       this.handleFocus);
-    window.addEventListener("beforeunload", this.handleUnload);
+    window.addEventListener("beforeunload", this.leave);
 
-    this.heartbeatTimer = setInterval(() => this.broadcast(), 150);
+    // Remote motion is extrapolated from velocity, so a slower heartbeat is fine
+    // and keeps the N² message traffic down when many windows are open.
+    this.heartbeatTimer = setInterval(() => this.broadcast(), 100);
     this.cleanupTimer   = setInterval(() => this.prune(),     400);
     this.broadcast();
   }
 
-  sendFusion(survivorId: string, victimId: string): void {
-    this.eventsChannel.postMessage({ type: "fusion", survivorId, victimId } satisfies FusionEvent);
+  setState(state: BubbleState): void {
+    const wasAlive = this.state.alive;
+    this.state = state;
+    // Death must propagate immediately so others stop colliding with us.
+    if (wasAlive && !state.alive) this.broadcast();
+  }
+
+  sendFusion(survivorId: string, victimId: string, victimRadius: number): void {
+    this.eventsChannel.postMessage({ type: "fusion", survivorId, victimId, victimRadius } satisfies FusionEvent);
   }
 
   sendAnnihilate(id1: string, id2: string): void {
     this.eventsChannel.postMessage({ type: "annihilate", id1, id2 } satisfies FusionEvent);
+  }
+
+  // The shell raised our window (shown, or brought to front) at `at` (epoch ms).
+  // focusedAt doubles as the stacking order: later = higher.
+  markRaised(at: number): void {
+    this.focusedAt = Math.max(this.focusedAt, at);
+    this.broadcast();
   }
 
   private handleFocus = () => {
@@ -81,30 +123,18 @@ export class WindowSync {
   };
 
   private broadcast(): void {
-    const chromeH = window.outerHeight - window.innerHeight;
-    const msg: HeartbeatMessage = {
-      type: "heartbeat",
-      id: this.myId,
-      screenX: window.screenX,
-      screenY: window.screenY + chromeH,
-      width:   window.innerWidth,
-      height:  window.innerHeight,
-      color:   this.myColor,
-      focusedAt: this.focusedAt,
-    };
-    this.channel.postMessage(msg);
+    const { lastSeen: _, ...info } = this.getMyInfo();
+    void _;
+    this.channel.postMessage({ type: "heartbeat", ...info } satisfies HeartbeatMessage);
   }
 
   private handleMessage = (e: MessageEvent<HeartbeatMessage>): void => {
     const d = e.data;
     if (d.type === "heartbeat") {
       const isNew = !this.windows.has(d.id);
-      this.windows.set(d.id, {
-        id: d.id, screenX: d.screenX, screenY: d.screenY,
-        width: d.width, height: d.height,
-        color: d.color, focusedAt: d.focusedAt,
-        lastSeen: Date.now(),
-      });
+      const { type: _, ...info } = d;
+      void _;
+      this.windows.set(d.id, { ...info, lastSeen: Date.now() });
       if (isNew) this.onWindowsChange?.(this.windows);
     } else if (d.type === "leave") {
       if (this.windows.delete(d.id)) this.onWindowsChange?.(this.windows);
@@ -120,13 +150,15 @@ export class WindowSync {
     if (changed) this.onWindowsChange?.(this.windows);
   }
 
-  private handleUnload = () => {
+  // Tell the others we are gone, then shut down. Also runs on unload.
+  leave = () => {
     this.channel.postMessage({ type: "leave", id: this.myId } satisfies HeartbeatMessage);
     this.destroy();
   };
 
   getMyInfo(): WindowInfo {
     const chromeH = window.outerHeight - window.innerHeight;
+    const now = Date.now();
     return {
       id: this.myId,
       screenX: window.screenX,
@@ -135,7 +167,9 @@ export class WindowSync {
       height:  window.innerHeight,
       color:   this.myColor,
       focusedAt: this.focusedAt,
-      lastSeen: Date.now(),
+      lastSeen: now,
+      sentAt:   now,
+      ...this.state,
     };
   }
 
@@ -143,7 +177,7 @@ export class WindowSync {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     if (this.cleanupTimer)   clearInterval(this.cleanupTimer);
     window.removeEventListener("focus",       this.handleFocus);
-    window.removeEventListener("beforeunload", this.handleUnload);
+    window.removeEventListener("beforeunload", this.leave);
     this.channel.removeEventListener("message", this.handleMessage);
     this.channel.close();
     this.eventsChannel.close();
